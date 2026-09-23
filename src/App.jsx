@@ -1,4 +1,5 @@
-import React, { useState, useId } from 'react';
+import React, { useState, useEffect, useRef } from 'react';
+import { supabase } from './supabaseClient';
 import {
   Wrench,
   QrCode,
@@ -24,7 +25,13 @@ import {
   PhoneCall,
   Calendar,
   Layers,
-  Image as ImageIcon
+  Image as ImageIcon,
+  RefreshCw,
+  Database,
+  UploadCloud,
+  Camera,
+  Trash2,
+  Link2
 } from 'lucide-react';
 
 // ==========================================
@@ -49,7 +56,7 @@ const PRESET_PHOTOS = [
   },
 ];
 
-const INITIAL_JOBS = [
+const INITIAL_FALLBACK_JOBS = [
   {
     id: 'FX-001',
     customerName: 'สมชาย พัฒนกุล',
@@ -57,7 +64,7 @@ const INITIAL_JOBS = [
     deviceModel: 'iPhone 14 Pro (Space Black)',
     issueDescription: 'หน้าจอแตกร้าวจากการตกกระแทก ทัชสกรีนส่วนล่างสะดุด กล้องหน้าใช้งานได้ปกติ',
     photoUrl: 'https://images.unsplash.com/photo-1592750475338-74b7b21085ab?auto=format&fit=crop&w=600&q=80',
-    status: 'repairing', // 'received' | 'repairing' | 'completed'
+    status: 'repairing',
     createdAt: '23 ก.ย. 2569 - 09:30 น.',
     estimatedCost: '4,200 ฿',
     technicianName: 'ช่างวิทย์ (เสาชิงช้า)',
@@ -118,6 +125,23 @@ const STATUS_CONFIG = {
   }
 };
 
+// Helper: Convert Supabase DB row (snake_case) to Frontend model (camelCase)
+const mapRowToJob = (row) => ({
+  id: row.id,
+  customerName: row.customer_name || row.customerName || 'ไม่ระบุชื่อ',
+  phone: row.phone || '',
+  deviceModel: row.device_model || row.deviceModel || 'ไม่ระบุรุ่น',
+  issueDescription: row.issue_description || row.issueDescription || '',
+  photoUrl: row.photo_url || row.photoUrl || PRESET_PHOTOS[0].url,
+  status: row.status || 'received',
+  createdAt: row.created_at
+    ? new Date(row.created_at).toLocaleString('th-TH', { dateStyle: 'medium', timeStyle: 'short' }) + ' น.'
+    : (row.createdAt || 'วันนี้'),
+  estimatedCost: row.estimated_cost || row.estimatedCost || '1,500 ฿',
+  technicianName: row.technician_name || row.technicianName || 'ช่างประจำเวร',
+  notes: row.notes || ''
+});
+
 // ==========================================
 // SUB-COMPONENTS: SHARED UI
 // ==========================================
@@ -136,7 +160,12 @@ function StatusBadge({ status, size = 'md' }) {
 // ==========================================
 // SCREEN 1: NEW JOB ORDER (หน้าเปิดบิลรับซ่อม)
 // ==========================================
-function ScreenNewOrder({ onOrderCreated }) {
+function ScreenNewOrder({ onOrderCreated, isSubmitting }) {
+  const fileInputRef = useRef(null);
+  const [isDragging, setIsDragging] = useState(false);
+  const [isProcessingImage, setIsProcessingImage] = useState(false);
+  const [photoMode, setPhotoMode] = useState('upload'); // 'upload' | 'url'
+
   const [formData, setFormData] = useState({
     customerName: '',
     phone: '',
@@ -149,6 +178,74 @@ function ScreenNewOrder({ onOrderCreated }) {
 
   const [errors, setErrors] = useState({});
 
+  // Process and compress image file
+  const handleFileSelect = (file) => {
+    if (!file) return;
+    if (!file.type.startsWith('image/')) {
+      alert('กรุณาเลือกไฟล์รูปภาพเท่านั้น (เช่น JPG, PNG, WEBP)');
+      return;
+    }
+
+    setIsProcessingImage(true);
+    const reader = new FileReader();
+    reader.onload = (e) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        const MAX_WIDTH = 1200;
+        const MAX_HEIGHT = 1200;
+        let width = img.width;
+        let height = img.height;
+
+        if (width > height) {
+          if (width > MAX_WIDTH) {
+            height *= MAX_WIDTH / width;
+            width = MAX_WIDTH;
+          }
+        } else {
+          if (height > MAX_HEIGHT) {
+            width *= MAX_HEIGHT / height;
+            height = MAX_HEIGHT;
+          }
+        }
+
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx.drawImage(img, 0, 0, width, height);
+
+        const compressedDataUrl = canvas.toDataURL('image/jpeg', 0.85);
+        setFormData((prev) => ({ ...prev, photoUrl: compressedDataUrl }));
+        setIsProcessingImage(false);
+      };
+      img.onerror = () => {
+        setIsProcessingImage(false);
+      };
+      img.src = e.target.result;
+    };
+    reader.onerror = () => {
+      setIsProcessingImage(false);
+    };
+    reader.readAsDataURL(file);
+  };
+
+  const handleDragOver = (e) => {
+    e.preventDefault();
+    setIsDragging(true);
+  };
+
+  const handleDragLeave = () => {
+    setIsDragging(false);
+  };
+
+  const handleDrop = (e) => {
+    e.preventDefault();
+    setIsDragging(false);
+    if (e.dataTransfer.files && e.dataTransfer.files[0]) {
+      handleFileSelect(e.dataTransfer.files[0]);
+    }
+  };
+
   const validate = () => {
     const err = {};
     if (!formData.customerName.trim()) err.customerName = 'กรุณากรอกชื่อลูกค้า';
@@ -159,9 +256,9 @@ function ScreenNewOrder({ onOrderCreated }) {
     return Object.keys(err).length === 0;
   };
 
-  const handleSubmit = (e) => {
+  const handleSubmit = async (e) => {
     e.preventDefault();
-    if (!validate()) return;
+    if (!validate() || isSubmitting) return;
 
     const newJob = {
       ...formData,
@@ -171,7 +268,7 @@ function ScreenNewOrder({ onOrderCreated }) {
       technicianName: 'ช่างประจำเวร (Desk-1)'
     };
 
-    onOrderCreated(newJob);
+    await onOrderCreated(newJob);
   };
 
   return (
@@ -292,20 +389,177 @@ function ScreenNewOrder({ onOrderCreated }) {
             {errors.issueDescription && <p className="text-xs text-rose-500 mt-1">{errors.issueDescription}</p>}
           </div>
 
-          {/* Photo Section */}
+          {/* Photo Section: Interactive Image Uploader */}
           <div className="bg-slate-50/80 p-5 rounded-2xl border border-slate-200">
-            <label className="block text-sm font-bold text-slate-800 mb-2 flex items-center gap-2">
-              <ImageIcon className="w-4 h-4 text-blue-600" />
-              ภาพถ่ายสภาพเครื่องก่อนซ่อม (Condition Before Repair)
-            </label>
-            <p className="text-xs text-slate-500 mb-3">
-              ใช้สำหรับเป็นหลักฐานสภาพตัวเครื่องตอนส่งมอบ (สามารถใส่ URL รูปภาพ หรือคลิกเลือกรูป Mockup ด้านล่าง)
-            </p>
+            <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-2 mb-3">
+              <div>
+                <label className="block text-sm font-bold text-slate-800 flex items-center gap-2">
+                  <ImageIcon className="w-4 h-4 text-blue-600" />
+                  ภาพถ่ายสภาพเครื่องก่อนซ่อม (Condition Before Repair)
+                </label>
+                <p className="text-xs text-slate-500 mt-0.5">
+                  แนบรูปเพื่อเป็นหลักฐานสภาพตัวเครื่องตอนส่งมอบเข้าระบบ
+                </p>
+              </div>
 
-            {/* Quick Mockup Selectors */}
-            <div className="mb-4">
-              <span className="text-xs font-semibold text-slate-600 block mb-2">
-                ⚡ เลือกภาพจำลองตัวอย่างทันใจ (Click to Apply):
+              {/* Mode Switcher Tabs */}
+              <div className="flex items-center bg-white p-1 rounded-xl border border-slate-200 text-xs font-semibold self-start sm:self-auto">
+                <button
+                  type="button"
+                  onClick={() => setPhotoMode('upload')}
+                  className={`flex items-center gap-1.5 px-3 py-1 rounded-lg transition ${
+                    photoMode === 'upload'
+                      ? 'bg-blue-600 text-white shadow-sm'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  <UploadCloud className="w-3.5 h-3.5" />
+                  <span>อัปโหลดรูปภาพ</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => setPhotoMode('url')}
+                  className={`flex items-center gap-1.5 px-3 py-1 rounded-lg transition ${
+                    photoMode === 'url'
+                      ? 'bg-blue-600 text-white shadow-sm'
+                      : 'text-slate-600 hover:text-slate-900'
+                  }`}
+                >
+                  <Link2 className="w-3.5 h-3.5" />
+                  <span>ใส่ลิงก์ URL</span>
+                </button>
+              </div>
+            </div>
+
+            {/* Hidden native file input */}
+            <input
+              type="file"
+              ref={fileInputRef}
+              accept="image/*"
+              className="hidden"
+              onChange={(e) => {
+                if (e.target.files && e.target.files[0]) {
+                  handleFileSelect(e.target.files[0]);
+                }
+              }}
+            />
+
+            {/* UPLOAD MODE */}
+            {photoMode === 'upload' && (
+              <div>
+                {formData.photoUrl ? (
+                  /* Image Preview Card with Replace / Remove controls */
+                  <div className="bg-white rounded-2xl p-4 border border-slate-200 shadow-sm flex flex-col sm:flex-row items-center gap-5">
+                    <div className="w-full sm:w-44 h-36 rounded-xl overflow-hidden bg-slate-100 border border-slate-200 flex-shrink-0 relative group">
+                      <img
+                        src={formData.photoUrl}
+                        alt="Uploaded preview"
+                        className="w-full h-full object-cover"
+                      />
+                      <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition flex items-center justify-center text-xs text-white font-medium">
+                        รูปภาพตัวอย่าง
+                      </div>
+                    </div>
+
+                    <div className="flex-1 w-full space-y-3 text-center sm:text-left">
+                      <div className="inline-flex items-center gap-1.5 px-2.5 py-1 rounded-full bg-emerald-50 text-emerald-700 border border-emerald-200 text-xs font-semibold">
+                        <CheckCircle2 className="w-3.5 h-3.5 text-emerald-600" />
+                        <span>แนบรูปภาพพร้อมใช้งานเรียบร้อย</span>
+                      </div>
+                      <p className="text-xs text-slate-500">
+                        รูปภาพจะถูกบันทึกและแสดงในใบรับซ่อมรวมถึงหน้าติดตามของลูกค้า
+                      </p>
+
+                      <div className="flex flex-wrap items-center justify-center sm:justify-start gap-2 pt-1">
+                        <button
+                          type="button"
+                          onClick={() => fileInputRef.current?.click()}
+                          className="px-3.5 py-2 bg-blue-50 hover:bg-blue-100 text-blue-700 rounded-xl text-xs font-bold transition flex items-center gap-1.5 border border-blue-200"
+                        >
+                          <Camera className="w-3.5 h-3.5" />
+                          <span>เลือกรูปใหม่ / ถ่ายภาพใหม่</span>
+                        </button>
+
+                        <button
+                          type="button"
+                          onClick={() => setFormData({ ...formData, photoUrl: '' })}
+                          className="px-3 py-2 bg-slate-100 hover:bg-rose-50 hover:text-rose-600 text-slate-600 rounded-xl text-xs font-semibold transition flex items-center gap-1.5 border border-slate-200 hover:border-rose-200"
+                        >
+                          <Trash2 className="w-3.5 h-3.5" />
+                          <span>ลบรูป</span>
+                        </button>
+                      </div>
+                    </div>
+                  </div>
+                ) : (
+                  /* Drag & Drop Upload Zone */
+                  <div
+                    onDragOver={handleDragOver}
+                    onDragLeave={handleDragLeave}
+                    onDrop={handleDrop}
+                    onClick={() => fileInputRef.current?.click()}
+                    className={`border-2 border-dashed rounded-2xl p-8 text-center cursor-pointer transition flex flex-col items-center justify-center group ${
+                      isDragging
+                        ? 'border-blue-600 bg-blue-50/70 scale-[1.01]'
+                        : 'border-slate-300 hover:border-blue-500 bg-white/80 hover:bg-blue-50/30'
+                    }`}
+                  >
+                    <div className="w-14 h-14 rounded-2xl bg-blue-50 text-blue-600 flex items-center justify-center mb-3 group-hover:scale-110 transition shadow-sm border border-blue-100">
+                      {isProcessingImage ? (
+                        <RefreshCw className="w-7 h-7 animate-spin text-blue-600" />
+                      ) : (
+                        <UploadCloud className="w-7 h-7" />
+                      )}
+                    </div>
+                    <p className="text-sm font-bold text-slate-800">
+                      {isProcessingImage
+                        ? 'กำลังประมวลผลรูปภาพ...'
+                        : 'คลิกเพื่อเลือกไฟล์รูปภาพ หรือ ลากไฟล์มาวางที่นี่'}
+                    </p>
+                    <p className="text-xs text-slate-400 mt-1">
+                      รองรับไฟล์ภาพ JPG, PNG, WEBP หรือถ่ายรูปด้วยกล้องมือถือ
+                    </p>
+                    <span className="mt-3 inline-flex items-center gap-1.5 px-3.5 py-1.5 rounded-xl bg-blue-600 text-white text-xs font-semibold shadow-sm">
+                      <Camera className="w-3.5 h-3.5" />
+                      <span>เลือกไฟล์จากเครื่อง</span>
+                    </span>
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* URL MODE */}
+            {photoMode === 'url' && (
+              <div className="flex flex-col sm:flex-row gap-4 items-start">
+                <div className="flex-1 w-full">
+                  <input
+                    type="url"
+                    value={formData.photoUrl}
+                    onChange={(e) => setFormData({ ...formData, photoUrl: e.target.value })}
+                    placeholder="วางลิงก์รูปภาพ เช่น https://images.unsplash.com/..."
+                    className="w-full px-4 py-2.5 text-xs rounded-xl border border-slate-200 bg-white text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
+                  />
+                </div>
+
+                {formData.photoUrl && (
+                  <div className="w-20 h-20 rounded-xl overflow-hidden border-2 border-white shadow-md flex-shrink-0 bg-slate-200 relative group">
+                    <img
+                      src={formData.photoUrl}
+                      alt="Preview"
+                      className="w-full h-full object-cover"
+                      onError={(e) => {
+                        e.target.src = PRESET_PHOTOS[0].url;
+                      }}
+                    />
+                  </div>
+                )}
+              </div>
+            )}
+
+            {/* Quick Mockup Preset Chips */}
+            <div className="mt-4 pt-3 border-t border-slate-200/60">
+              <span className="text-[11px] font-semibold text-slate-500 block mb-2">
+                ⚡ หรือคลิกเลือกรูปภาพจำลองอาการเสียด่วน (Quick Presets):
               </span>
               <div className="flex flex-wrap gap-2">
                 {PRESET_PHOTOS.map((preset, idx) => (
@@ -324,50 +578,33 @@ function ScreenNewOrder({ onOrderCreated }) {
                 ))}
               </div>
             </div>
-
-            {/* Custom URL Input & Preview */}
-            <div className="flex flex-col sm:flex-row gap-4 items-start">
-              <div className="flex-1 w-full">
-                <input
-                  type="url"
-                  value={formData.photoUrl}
-                  onChange={(e) => setFormData({ ...formData, photoUrl: e.target.value })}
-                  placeholder="https://images.unsplash.com/..."
-                  className="w-full px-4 py-2 text-xs rounded-xl border border-slate-200 bg-white text-slate-900 focus:outline-none focus:ring-2 focus:ring-blue-500/20"
-                />
-              </div>
-
-              {formData.photoUrl && (
-                <div className="w-24 h-24 rounded-xl overflow-hidden border-2 border-white shadow-md flex-shrink-0 bg-slate-200 relative group">
-                  <img
-                    src={formData.photoUrl}
-                    alt="Preview"
-                    className="w-full h-full object-cover"
-                    onError={(e) => {
-                      e.target.src = 'https://images.unsplash.com/photo-1592750475338-74b7b21085ab?auto=format&fit=crop&w=600&q=80';
-                    }}
-                  />
-                  <div className="absolute inset-0 bg-black/40 opacity-0 group-hover:opacity-100 transition flex items-center justify-center text-[10px] text-white font-medium">
-                    พรีวิวภาพ
-                  </div>
-                </div>
-              )}
-            </div>
           </div>
 
           {/* Submit Action */}
           <div className="pt-4 border-t border-slate-100 flex flex-col sm:flex-row items-center justify-between gap-4">
             <div className="text-xs text-slate-500 flex items-center gap-1.5">
-              <ShieldCheck className="w-4 h-4 text-emerald-600" />
-              <span>ข้อมูลจะถูกบันทึกและสร้างรหัส QR Code โดยอัตโนมัติ</span>
+              <Database className="w-4 h-4 text-emerald-600" />
+              <span>บันทึกลงฐานข้อมูล Supabase และสร้างรหัส QR Code อัตโนมัติ</span>
             </div>
 
             <button
               type="submit"
-              className="w-full sm:w-auto px-7 py-3.5 bg-blue-600 hover:bg-blue-700 active:scale-[0.98] text-white font-bold text-sm rounded-xl shadow-lg shadow-blue-500/30 transition flex items-center justify-center gap-2"
+              disabled={isSubmitting}
+              className={`w-full sm:w-auto px-7 py-3.5 bg-blue-600 hover:bg-blue-700 active:scale-[0.98] text-white font-bold text-sm rounded-xl shadow-lg shadow-blue-500/30 transition flex items-center justify-center gap-2 ${
+                isSubmitting ? 'opacity-70 cursor-not-allowed' : ''
+              }`}
             >
-              <span>+ ยืนยันออกใบรับซ่อม</span>
-              <ArrowRight className="w-4 h-4" />
+              {isSubmitting ? (
+                <>
+                  <RefreshCw className="w-4 h-4 animate-spin" />
+                  <span>กำลังบันทึกลงฐานข้อมูล...</span>
+                </>
+              ) : (
+                <>
+                  <span>+ ยืนยันออกใบรับซ่อม</span>
+                  <ArrowRight className="w-4 h-4" />
+                </>
+              )}
             </button>
           </div>
         </form>
@@ -398,8 +635,8 @@ function ScreenQrDisplay({ job, onNavigateCustomerView, onNavigateDashboard }) {
     );
   }
 
-  // Simulated customer tracking URL
-  const trackingUrl = `https://quickfix.track/portal?order=${job.id}`;
+  // Simulated customer tracking URL (can be opened by customer)
+  const trackingUrl = `${window.location.origin}/#track=${job.id}`;
   const qrApiUrl = `https://api.qrserver.com/v1/create-qr-code/?size=220x220&data=${encodeURIComponent(trackingUrl)}&margin=10`;
 
   const handleCopyLink = () => {
@@ -414,7 +651,7 @@ function ScreenQrDisplay({ job, onNavigateCustomerView, onNavigateDashboard }) {
       <div className="text-center mb-6">
         <div className="inline-flex items-center gap-2 bg-emerald-50 text-emerald-700 border border-emerald-200 px-4 py-1.5 rounded-full text-xs font-bold mb-3 shadow-sm">
           <CheckCircle2 className="w-4 h-4 text-emerald-600" />
-          <span>ออกใบรับซ่อมเข้าระบบสำเร็จแล้ว</span>
+          <span>ออกใบรับซ่อมและบันทึกลงฐานข้อมูลเรียบร้อยแล้ว</span>
         </div>
         <h1 className="text-2xl sm:text-3xl font-extrabold text-slate-900 tracking-tight">
           QR Code ติดตามสถานะงานซ่อม
@@ -454,7 +691,7 @@ function ScreenQrDisplay({ job, onNavigateCustomerView, onNavigateDashboard }) {
 
           <p className="text-xs text-slate-500 text-center max-w-sm mb-6">
             สแกนเพื่อดูความคืบหน้า: <br className="hidden sm:inline" />
-            <span className="text-slate-700 font-mono text-[11px] bg-slate-100 px-2 py-0.5 rounded">
+            <span className="text-slate-700 font-mono text-[11px] bg-slate-100 px-2 py-0.5 rounded break-all">
               {trackingUrl}
             </span>
           </p>
@@ -535,7 +772,7 @@ function ScreenQrDisplay({ job, onNavigateCustomerView, onNavigateDashboard }) {
 // ==========================================
 // SCREEN 3: CUSTOMER TRACKING PORTAL (หน้ารายละเอียดและติดตามสถานะงาน)
 // ==========================================
-function ScreenCustomerTracking({ jobs, selectedJobId, onSelectJob }) {
+function ScreenCustomerTracking({ jobs, selectedJobId, onSelectJob, isDbConnected }) {
   const currentJob = jobs.find((j) => j.id === selectedJobId) || jobs[0];
 
   if (!currentJob) {
@@ -575,7 +812,7 @@ function ScreenCustomerTracking({ jobs, selectedJobId, onSelectJob }) {
 
   return (
     <div className="max-w-3xl mx-auto px-4 py-8">
-      {/* Customer Mode Badge & Job Switcher for Demo testing */}
+      {/* Customer Mode Badge & Job Switcher */}
       <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 mb-6 bg-blue-50/70 border border-blue-200/80 p-4 rounded-2xl">
         <div className="flex items-center gap-2.5">
           <div className="w-9 h-9 rounded-xl bg-blue-600 text-white flex items-center justify-center shadow-sm">
@@ -586,7 +823,10 @@ function ScreenCustomerTracking({ jobs, selectedJobId, onSelectJob }) {
               <span className="text-[11px] font-bold uppercase tracking-wider text-blue-700 bg-white px-2 py-0.5 rounded-full border border-blue-200">
                 Screen 3: มุมมองลูกค้า
               </span>
-              <span className="text-[11px] text-blue-600 font-medium">Real-time Portal</span>
+              <span className="text-[11px] text-blue-600 font-medium flex items-center gap-1">
+                <span className="w-1.5 h-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
+                {isDbConnected ? 'Supabase Real-time' : 'Local State'}
+              </span>
             </div>
             <h2 className="text-sm font-bold text-slate-800">
               สถานะงานซ่อม: <span className="font-mono text-blue-700">#{currentJob.id}</span>
@@ -658,7 +898,6 @@ function ScreenCustomerTracking({ jobs, selectedJobId, onSelectJob }) {
               {STEPS.map((s) => {
                 const isPassed = currentStep > s.num;
                 const isCurrent = currentStep === s.num;
-                const isPending = currentStep < s.num;
                 const IconComponent = s.icon;
 
                 return (
@@ -808,7 +1047,7 @@ function ScreenCustomerTracking({ jobs, selectedJobId, onSelectJob }) {
 // ==========================================
 // SCREEN 4: TECHNICIAN DASHBOARD (หน้าแดชบอร์ดช่าง)
 // ==========================================
-function ScreenTechDashboard({ jobs, onStatusChange, onViewQr, onTrackJob, onNewOrderClick }) {
+function ScreenTechDashboard({ jobs, onStatusChange, onViewQr, onTrackJob, onNewOrderClick, isDbConnected, onRefresh, isLoading }) {
   const [searchQuery, setSearchQuery] = useState('');
   const [filterStatus, setFilterStatus] = useState('all');
 
@@ -840,7 +1079,12 @@ function ScreenTechDashboard({ jobs, onStatusChange, onViewQr, onTrackJob, onNew
             <span className="text-xs font-bold uppercase tracking-wider text-blue-600 bg-blue-50 px-2.5 py-0.5 rounded-full">
               Screen 4: ฝั่งช่าง
             </span>
-            <span className="text-xs text-slate-400">Management Hub</span>
+            <span className={`text-xs px-2 py-0.5 rounded-full font-semibold flex items-center gap-1 ${
+              isDbConnected ? 'bg-emerald-50 text-emerald-700 border border-emerald-200' : 'bg-amber-50 text-amber-700 border border-amber-200'
+            }`}>
+              <Database className="w-3 h-3" />
+              <span>{isDbConnected ? 'Supabase Connected' : 'Local Fallback'}</span>
+            </span>
           </div>
           <h1 className="text-2xl sm:text-3xl font-extrabold text-slate-900 mt-1">
             แดชบอร์ดจัดการงานซ่อม (Technician Dashboard)
@@ -850,13 +1094,24 @@ function ScreenTechDashboard({ jobs, onStatusChange, onViewQr, onTrackJob, onNew
           </p>
         </div>
 
-        <button
-          onClick={onNewOrderClick}
-          className="inline-flex items-center justify-center gap-2 px-5 py-3 bg-blue-600 hover:bg-blue-700 text-white font-bold text-sm rounded-xl shadow-lg shadow-blue-500/25 transition active:scale-[0.98]"
-        >
-          <PlusCircle className="w-4 h-4" />
-          <span>+ เปิดบิลรับซ่อมใหม่</span>
-        </button>
+        <div className="flex items-center gap-2">
+          <button
+            onClick={onRefresh}
+            disabled={isLoading}
+            className="p-3 bg-white hover:bg-slate-100 text-slate-600 rounded-xl border border-slate-200 shadow-sm transition active:scale-95"
+            title="รีเฟรชข้อมูลจาก Supabase"
+          >
+            <RefreshCw className={`w-4 h-4 ${isLoading ? 'animate-spin text-blue-600' : ''}`} />
+          </button>
+
+          <button
+            onClick={onNewOrderClick}
+            className="inline-flex items-center justify-center gap-2 px-5 py-3 bg-blue-600 hover:bg-blue-700 text-white font-bold text-sm rounded-xl shadow-lg shadow-blue-500/25 transition active:scale-[0.98]"
+          >
+            <PlusCircle className="w-4 h-4" />
+            <span>+ เปิดบิลรับซ่อมใหม่</span>
+          </button>
+        </div>
       </div>
 
       {/* Overview Stat Cards */}
@@ -1060,40 +1315,153 @@ function ScreenTechDashboard({ jobs, onStatusChange, onViewQr, onTrackJob, onNew
 // ==========================================
 export default function App() {
   // Central State Management
-  const [jobs, setJobs] = useState(INITIAL_JOBS);
+  const [jobs, setJobs] = useState(INITIAL_FALLBACK_JOBS);
   const [currentScreen, setCurrentScreen] = useState('tech-dashboard'); // 'new-order' | 'qr-display' | 'customer-tracking' | 'tech-dashboard'
-  const [activeJobId, setActiveJobId] = useState(INITIAL_JOBS[0].id);
+  const [activeJobId, setActiveJobId] = useState(INITIAL_FALLBACK_JOBS[0].id);
   const [toastMessage, setToastMessage] = useState(null);
+  const [isDbConnected, setIsDbConnected] = useState(false);
+  const [isLoading, setIsLoading] = useState(false);
+  const [isSubmitting, setIsSubmitting] = useState(false);
+  const [dbSetupNeeded, setDbSetupNeeded] = useState(false);
 
   const showToast = (msg) => {
     setToastMessage(msg);
     setTimeout(() => setToastMessage(null), 3000);
   };
 
-  // Handler: When a new repair order is created
-  const handleOrderCreated = (newJob) => {
-    setJobs([newJob, ...jobs]);
-    setActiveJobId(newJob.id);
-    setCurrentScreen('qr-display');
-    showToast(`ออกใบรับซ่อมสำเร็จ! รหัส #${newJob.id}`);
+  // 1. Fetch jobs from Supabase
+  const fetchJobs = async () => {
+    setIsLoading(true);
+    try {
+      const { data, error } = await supabase
+        .from('jobs')
+        .select('*')
+        .order('created_at', { ascending: false });
+
+      if (error) {
+        // Table not created or permission error
+        console.warn('Supabase fetch notice:', error.message);
+        setDbSetupNeeded(true);
+        setIsDbConnected(false);
+      } else if (data && data.length > 0) {
+        const mapped = data.map(mapRowToJob);
+        setJobs(mapped);
+        setIsDbConnected(true);
+        setDbSetupNeeded(false);
+      } else if (data && data.length === 0) {
+        // Table exists but is empty
+        setIsDbConnected(true);
+        setDbSetupNeeded(false);
+      }
+    } catch (err) {
+      console.error('Supabase connection error:', err);
+      setIsDbConnected(false);
+    } finally {
+      setIsLoading(false);
+    }
   };
 
-  // Handler: When status is changed by technician
-  const handleStatusChange = (jobId, newStatus) => {
+  // 2. Initial load & Supabase Realtime subscription
+  useEffect(() => {
+    fetchJobs();
+
+    // Check URL hash for direct tracking e.g. #track=FX-001
+    const checkHash = () => {
+      const hash = window.location.hash;
+      if (hash.startsWith('#track=')) {
+        const id = hash.replace('#track=', '');
+        if (id) {
+          setActiveJobId(id);
+          setCurrentScreen('customer-tracking');
+        }
+      }
+    };
+    checkHash();
+    window.addEventListener('hashchange', checkHash);
+
+    // Subscribe to real-time changes
+    const channel = supabase
+      .channel('public:jobs')
+      .on('postgres_changes', { event: '*', schema: 'public', table: 'jobs' }, () => {
+        fetchJobs();
+      })
+      .subscribe();
+
+    return () => {
+      window.removeEventListener('hashchange', checkHash);
+      supabase.removeChannel(channel);
+    };
+  }, []);
+
+  // 3. Handler: When a new repair order is created
+  const handleOrderCreated = async (newJob) => {
+    setIsSubmitting(true);
+    // Optimistic UI update
+    setJobs((prev) => [newJob, ...prev]);
+    setActiveJobId(newJob.id);
+    setCurrentScreen('qr-display');
+
+    try {
+      const { error } = await supabase.from('jobs').insert([
+        {
+          id: newJob.id,
+          customer_name: newJob.customerName,
+          phone: newJob.phone,
+          device_model: newJob.deviceModel,
+          issue_description: newJob.issueDescription,
+          photo_url: newJob.photoUrl,
+          status: newJob.status,
+          estimated_cost: newJob.estimatedCost,
+          technician_name: newJob.technicianName,
+          notes: newJob.notes
+        }
+      ]);
+
+      if (error) {
+        console.warn('Could not insert to Supabase, saved locally:', error.message);
+        showToast(`ออกใบรับซ่อมสำเร็จ #${newJob.id} (บันทึกใน Local State)`);
+      } else {
+        showToast(`ออกใบรับซ่อมและบันทึกลง Supabase สำเร็จ #${newJob.id}`);
+        fetchJobs();
+      }
+    } catch (err) {
+      console.error(err);
+      showToast(`ออกใบรับซ่อมสำเร็จ #${newJob.id}`);
+    } finally {
+      setIsSubmitting(false);
+    }
+  };
+
+  // 4. Handler: When status is changed by technician
+  const handleStatusChange = async (jobId, newStatus) => {
+    // Optimistic UI update
     setJobs((prevJobs) =>
       prevJobs.map((j) => (j.id === jobId ? { ...j, status: newStatus } : j))
     );
+
     const label = STATUS_CONFIG[newStatus]?.shortLabel || newStatus;
     showToast(`อัปเดตสถานะ #${jobId} เป็น "${label}" เรียบร้อยแล้ว`);
+
+    try {
+      const { error } = await supabase
+        .from('jobs')
+        .update({ status: newStatus })
+        .eq('id', jobId);
+
+      if (error) {
+        console.warn('Supabase update warning:', error.message);
+      }
+    } catch (err) {
+      console.error(err);
+    }
   };
 
-  // Handler: Open QR display
+  // Handlers for navigation
   const handleViewQr = (jobId) => {
     setActiveJobId(jobId);
     setCurrentScreen('qr-display');
   };
 
-  // Handler: Navigate to customer tracking
   const handleNavigateCustomer = (jobId) => {
     if (jobId) setActiveJobId(jobId);
     setCurrentScreen('customer-tracking');
@@ -1103,6 +1471,20 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-slate-50 text-slate-800 flex flex-col font-['Prompt',sans-serif]">
+      {/* ========================================== */}
+      {/* SUPABASE SETUP NOTICE (IF TABLE NOT YET CREATED) */}
+      {/* ========================================== */}
+      {dbSetupNeeded && (
+        <div className="bg-amber-500 text-slate-950 px-4 py-2 text-xs font-semibold flex items-center justify-between shadow-sm">
+          <div className="flex items-center gap-2 max-w-5xl mx-auto w-full">
+            <AlertCircle className="w-4 h-4 flex-shrink-0 text-slate-950" />
+            <span>
+              <strong>แจ้งเตือน:</strong> โปรเจกต์เชื่อมต่อกับ Supabase แล้ว แต่ยังไม่ได้สร้างตาราง <code className="bg-amber-600/30 px-1 py-0.5 rounded font-mono">jobs</code> ใน Supabase (ระบบกำลังทำงานด้วย Local Mockup ชั่วคราว)
+            </span>
+          </div>
+        </div>
+      )}
+
       {/* ========================================== */}
       {/* TOP NAVIGATION BAR */}
       {/* ========================================== */}
@@ -1121,8 +1503,10 @@ export default function App() {
                 <span className="font-extrabold text-base sm:text-lg text-slate-900 tracking-tight">
                   QuickFix <span className="text-blue-600">Track</span>
                 </span>
-                <span className="hidden sm:inline-block text-[10px] font-bold px-1.5 py-0.5 rounded bg-blue-100 text-blue-700">
-                  PROTOTYPE
+                <span className={`hidden sm:inline-block text-[10px] font-bold px-1.5 py-0.5 rounded ${
+                  isDbConnected ? 'bg-emerald-100 text-emerald-800' : 'bg-blue-100 text-blue-700'
+                }`}>
+                  {isDbConnected ? 'SUPABASE LIVE' : 'PROTOTYPE'}
                 </span>
               </div>
               <span className="hidden sm:block text-[11px] text-slate-400 -mt-1 font-medium">
@@ -1199,7 +1583,7 @@ export default function App() {
       {/* ========================================== */}
       <main className="flex-1 pb-16">
         {currentScreen === 'new-order' && (
-          <ScreenNewOrder onOrderCreated={handleOrderCreated} />
+          <ScreenNewOrder onOrderCreated={handleOrderCreated} isSubmitting={isSubmitting} />
         )}
 
         {currentScreen === 'qr-display' && (
@@ -1215,6 +1599,7 @@ export default function App() {
             jobs={jobs}
             selectedJobId={activeJobId}
             onSelectJob={(id) => setActiveJobId(id)}
+            isDbConnected={isDbConnected}
           />
         )}
 
@@ -1225,6 +1610,9 @@ export default function App() {
             onViewQr={handleViewQr}
             onTrackJob={handleNavigateCustomer}
             onNewOrderClick={() => setCurrentScreen('new-order')}
+            isDbConnected={isDbConnected}
+            onRefresh={fetchJobs}
+            isLoading={isLoading}
           />
         )}
       </main>
@@ -1237,10 +1625,11 @@ export default function App() {
           <div className="flex items-center gap-2">
             <span className="font-bold text-slate-700">QuickFix Track System</span>
             <span>•</span>
-            <span>React SPA Prototype</span>
+            <span>React SPA + Supabase Database</span>
           </div>
-          <div>
-            สถานะปัจจุบันจำลอง: <span className="font-mono text-slate-600 font-semibold">{jobs.length} ใบงาน</span> ในเครื่อง (In-memory State)
+          <div className="flex items-center gap-2">
+            <span className={`w-2 h-2 rounded-full ${isDbConnected ? 'bg-emerald-500' : 'bg-amber-500'}`}></span>
+            <span>สถานะระบบ: <strong>{isDbConnected ? 'เชื่อมต่อ Supabase Real-time แล้ว' : 'ใช้ In-memory State'}</strong> ({jobs.length} ใบงาน)</span>
           </div>
         </div>
       </footer>
